@@ -1,6 +1,8 @@
 use std::{
     env,
+    fs,
     io::{self, Read, Write},
+    os::unix::io::AsRawFd,
     path::PathBuf,
     sync::{Arc, Mutex, mpsc},
     thread,
@@ -27,10 +29,21 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Widget},
 };
+use serde::{Deserialize, Serialize};
+
+mod layout;
+mod platform;
+mod terminal;
+mod ui;
+use layout::*;
+use platform::*;
+use terminal::*;
+use ui::render;
 
 const SIDEBAR_WIDTH: u16 = 29;
 const COLLAPSED_WIDTH: u16 = 4;
 const MOBILE_THRESHOLD: u16 = 72;
+const WORKSPACE_VERSION: u32 = 1;
 
 struct Session {
     id: u64,
@@ -41,14 +54,15 @@ struct Session {
     pending: Arc<std::sync::atomic::AtomicBool>,
     group: Option<u64>,
     parser: Arc<Mutex<vt100::Parser>>,
-    writer: Box<dyn Write + Send>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     master: Box<dyn MasterPty + Send>,
     _child: Box<dyn Child + Send + Sync>,
     shell_pid: Option<u32>,
+    restore_grace_until: Option<Instant>,
 }
 
 impl Session {
-    fn spawn(id: u64, rows: u16, cols: u16) -> Result<Self> {
+    fn spawn(id: u64, rows: u16, cols: u16, cwd: PathBuf, host_bg: Option<(u8, u8, u8)>) -> Result<Self> {
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows,
@@ -59,7 +73,12 @@ impl Session {
             .context("open PTY")?;
         let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
         let mut command = CommandBuilder::new(&shell);
-        command.cwd(env::current_dir()?);
+        let cwd = if cwd.is_dir() {
+            cwd
+        } else {
+            env::current_dir()?
+        };
+        command.cwd(&cwd);
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
         let child = pair.slave.spawn_command(command).context("start shell")?;
@@ -67,12 +86,14 @@ impl Session {
         drop(pair.slave);
 
         let mut reader = pair.master.try_clone_reader().context("clone PTY reader")?;
-        let writer = pair.master.take_writer().context("open PTY writer")?;
+        let writer = Arc::new(Mutex::new(pair.master.take_writer().context("open PTY writer")?));
         let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 10_000)));
-        let cwd = Arc::new(Mutex::new(env::current_dir()?));
+        let cwd = Arc::new(Mutex::new(cwd));
         let pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let parser_for_reader = Arc::clone(&parser);
         let cwd_for_reader = Arc::clone(&cwd);
+        let writer_for_reader = Arc::clone(&writer);
+        let host_bg_for_reader = host_bg;
         thread::spawn(move || {
             let mut bytes = [0_u8; 16 * 1024];
             while let Ok(read) = reader.read(&mut bytes) {
@@ -81,6 +102,9 @@ impl Session {
                 }
                 if let Ok(mut parser) = parser_for_reader.lock() {
                     parser.process(&bytes[..read]);
+                }
+                if let Ok(mut w) = writer_for_reader.lock() {
+                    respond_to_osc_queries(&bytes[..read], &mut *w, host_bg_for_reader);
                 }
                 update_cwd_from_osc7(&bytes[..read], &cwd_for_reader);
             }
@@ -99,6 +123,7 @@ impl Session {
             master: pair.master,
             _child: child,
             shell_pid,
+            restore_grace_until: None,
         })
     }
 
@@ -122,6 +147,12 @@ impl Session {
     }
 
     fn is_pending(&self) -> bool {
+        if self
+            .restore_grace_until
+            .is_some_and(|until| Instant::now() < until)
+        {
+            return true;
+        }
         if !self.pending.load(std::sync::atomic::Ordering::Relaxed) {
             return false;
         }
@@ -151,10 +182,44 @@ impl Session {
             parser.screen_mut().set_size(area.height, area.width);
         }
     }
+
+    fn scroll_viewport(&self, delta: isize) {
+        if let Ok(mut parser) = self.parser.lock() {
+            let screen = parser.screen_mut();
+            let current = screen.scrollback();
+            let next = if delta.is_negative() {
+                current.saturating_sub(delta.unsigned_abs())
+            } else {
+                current.saturating_add(delta as usize)
+            };
+            screen.set_scrollback(next);
+        }
+    }
+
+    fn wheel_input(&self, up: bool, column: u16, row: u16) -> Option<Vec<u8>> {
+        let parser = self.parser.lock().ok()?;
+        let screen = parser.screen();
+        if screen.mouse_protocol_mode() == vt100::MouseProtocolMode::None {
+            return None;
+        }
+        Some(encode_mouse_wheel(
+            screen.mouse_protocol_encoding(),
+            up,
+            column,
+            row,
+        ))
+    }
 }
 
 fn display_name_for<'a>(custom_name: Option<&'a str>, last_command: Option<&'a str>) -> &'a str {
     custom_name.or(last_command).unwrap_or("New Tab")
+}
+
+fn group_display_name(names: &std::collections::HashMap<u64, String>, group: u64) -> String {
+    names
+        .get(&group)
+        .cloned()
+        .unwrap_or_else(|| format!("Group {group}"))
 }
 
 #[derive(Clone, Copy)]
@@ -164,13 +229,13 @@ struct TabHit {
     close: Rect,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 enum SplitAxis {
     Horizontal,
     Vertical,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Deserialize, Serialize)]
 enum PaneLayout {
     Leaf(u64),
     Split {
@@ -237,8 +302,30 @@ enum InputMode {
     ConfirmClose { session_id: u64 },
 }
 
+#[derive(Deserialize, Serialize)]
+struct WorkspaceSnapshot {
+    version: u32,
+    active_session: u64,
+    next_session_id: u64,
+    next_group_id: u64,
+    sessions: Vec<PersistedSession>,
+    group_names: std::collections::HashMap<u64, String>,
+    group_layouts: std::collections::HashMap<u64, PaneLayout>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct PersistedSession {
+    id: u64,
+    custom_name: Option<String>,
+    last_command: Option<String>,
+    cwd: PathBuf,
+    group: Option<u64>,
+    running_command: Option<String>,
+}
+
 struct App {
     host_terminal: String,
+    host_bg: Option<(u8, u8, u8)>,
     sessions: Vec<Session>,
     active: usize,
     sidebar_collapsed: bool,
@@ -253,6 +340,7 @@ struct App {
     input_mode: InputMode,
     spinner_tick: usize,
     exit_requested: bool,
+    clear_workspace_on_exit: bool,
     prefix_started: Option<Instant>,
     dragging_split: Option<SplitHit>,
 }
@@ -262,39 +350,120 @@ impl App {
         group_display_name(&self.group_names, group)
     }
 
-    fn new(area: Rect) -> Result<Self> {
+    fn new(area: Rect, host_bg: Option<(u8, u8, u8)>) -> Result<Self> {
         let terminal = terminal_area(area, false);
-        Ok(Self {
-            host_terminal: detect_host_terminal(),
-            sessions: vec![Session::spawn(
+        let snapshot = load_workspace_snapshot()
+            .ok()
+            .flatten()
+            .filter(|snapshot| snapshot.version == WORKSPACE_VERSION);
+        let mut sessions = Vec::new();
+        let mut commands_to_restart = Vec::new();
+        let mut active_session = None;
+        let mut next_session_id = 2;
+        let mut next_group_id = 1;
+        let mut group_names = std::collections::HashMap::new();
+        let mut group_layouts = std::collections::HashMap::new();
+
+        if let Some(snapshot) = snapshot {
+            active_session = Some(snapshot.active_session);
+            next_session_id = snapshot.next_session_id;
+            next_group_id = snapshot.next_group_id;
+            group_names = snapshot.group_names;
+            group_layouts = snapshot.group_layouts;
+            for persisted in snapshot.sessions {
+                let mut session = Session::spawn(
+                    persisted.id,
+                    terminal.height.max(2),
+                    terminal.width.max(2),
+                    persisted.cwd,
+                    host_bg,
+                )?;
+                session.custom_name = persisted.custom_name;
+                session.group = persisted.group;
+                if persisted.running_command.is_some() {
+                    session.last_command = persisted.last_command;
+                }
+                if let Some(command) = persisted.running_command {
+                    commands_to_restart.push((persisted.id, command));
+                }
+                sessions.push(session);
+            }
+        }
+        if sessions.is_empty() {
+            sessions.push(Session::spawn(
                 1,
                 terminal.height.max(2),
                 terminal.width.max(2),
-            )?],
-            active: 0,
+                env::current_dir()?,
+                host_bg,
+            )?);
+        }
+        next_session_id = next_session_id.max(
+            sessions
+                .iter()
+                .map(|session| session.id + 1)
+                .max()
+                .unwrap_or(2),
+        );
+        let active = active_session
+            .and_then(|id| sessions.iter().position(|session| session.id == id))
+            .unwrap_or(0);
+        let mut app = Self {
+            host_terminal: detect_host_terminal(),
+            host_bg,
+            sessions,
+            active,
             sidebar_collapsed: false,
             manual_collapse: false,
             hits: HitAreas::default(),
             last_area: area,
-            next_session_id: 2,
-            next_group_id: 1,
-            group_names: std::collections::HashMap::new(),
-            group_layouts: std::collections::HashMap::new(),
+            next_session_id,
+            next_group_id,
+            group_names,
+            group_layouts,
             context_menu: None,
             input_mode: InputMode::Normal,
             spinner_tick: 0,
             exit_requested: false,
+            clear_workspace_on_exit: false,
             prefix_started: None,
             dragging_split: None,
-        })
+        };
+        app.cleanup_groups();
+        for (session_id, command) in commands_to_restart {
+            if let Some(index) = app
+                .sessions
+                .iter()
+                .position(|session| session.id == session_id)
+            {
+                app.sessions[index]
+                    .pending
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                app.sessions[index].restore_grace_until =
+                    Some(Instant::now() + Duration::from_secs(3));
+                let command = format!("{command}\r");
+                if let Ok(mut w) = app.sessions[index].writer.lock() {
+                    let _ = w.write_all(command.as_bytes());
+                    let _ = w.flush();
+                }
+            }
+        }
+        Ok(app)
     }
 
     fn add_session(&mut self) -> Result<()> {
         let area = self.hits.terminal;
+        let cwd = self
+            .sessions
+            .get(self.active)
+            .and_then(|session| session.cwd.lock().ok().map(|cwd| cwd.clone()))
+            .unwrap_or(env::current_dir()?);
         self.sessions.push(Session::spawn(
             self.next_session_id,
             area.height.max(2),
             area.width.max(2),
+            cwd,
+            self.host_bg,
         )?);
         self.next_session_id += 1;
         self.active = self.sessions.len() - 1;
@@ -316,8 +485,10 @@ impl App {
 
     fn write_active(&mut self, bytes: &[u8]) {
         if let Some(session) = self.sessions.get_mut(self.active) {
-            let _ = session.writer.write_all(bytes);
-            let _ = session.writer.flush();
+            if let Ok(mut w) = session.writer.lock() {
+                let _ = w.write_all(bytes);
+                let _ = w.flush();
+            }
         }
     }
 
@@ -434,6 +605,7 @@ impl App {
         }
         if self.sessions.len() == 1 {
             self.exit_requested = true;
+            self.clear_workspace_on_exit = true;
             return;
         }
         let id = self.sessions[index].id;
@@ -827,7 +999,9 @@ impl App {
                 KeyCode::Enter => {
                     let command = session.input_line.trim().to_string();
                     if !command.is_empty() {
-                        session.last_command = Some(command);
+                        if !session.is_pending() {
+                            session.last_command = Some(command);
+                        }
                         session
                             .pending
                             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -963,10 +1137,25 @@ impl App {
         {
             self.open_group_context_menu(group, mouse.column, mouse.row);
         }
-        match mouse.kind {
-            MouseEventKind::ScrollUp => self.write_active(b"\x1b[A\x1b[A\x1b[A"),
-            MouseEventKind::ScrollDown => self.write_active(b"\x1b[B\x1b[B\x1b[B"),
-            _ => {}
+        if let MouseEventKind::ScrollUp | MouseEventKind::ScrollDown = mouse.kind
+            && let Some((index, area)) = self
+                .hits
+                .panes
+                .iter()
+                .find(|(_, area)| contains(*area, mouse.column, mouse.row))
+                .copied()
+        {
+            let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
+            let column = mouse.column.saturating_sub(area.x);
+            let row = mouse.row.saturating_sub(area.y);
+            self.active = index;
+            if let Some(bytes) = self.sessions[index].wheel_input(up, column, row) {
+                if let Ok(mut w) = self.sessions[index].writer.lock() {
+                    let _ = w.write_all(&bytes);
+                    let _ = w.flush();
+                }
+            }
+            self.sessions[index].scroll_viewport(if up { 3 } else { -3 });
         }
         Ok(())
     }
@@ -980,7 +1169,9 @@ impl App {
                     .rev()
                     .find(|line| !line.trim().is_empty())
                 {
-                    session.last_command = Some(command.trim().to_string());
+                    if !session.is_pending() {
+                        session.last_command = Some(command.trim().to_string());
+                    }
                     session
                         .pending
                         .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -996,314 +1187,51 @@ impl App {
         }
         self.write_active(text.as_bytes());
     }
-}
 
-fn group_display_name(names: &std::collections::HashMap<u64, String>, group: u64) -> String {
-    names
-        .get(&group)
-        .cloned()
-        .unwrap_or_else(|| format!("Group {group}"))
-}
-
-fn detect_host_terminal() -> String {
-    detect_terminal_from_env(|name| env::var(name).ok())
-        .or_else(detect_terminal_from_process_tree)
-        .unwrap_or_else(|| "terminal".to_string())
-}
-
-fn detect_terminal_from_env(lookup: impl Fn(&str) -> Option<String>) -> Option<String> {
-    if let Some(program) = lookup("TERM_PROGRAM") {
-        return Some(terminal_display_name(&program));
-    }
-    for (variable, label) in [
-        ("KITTY_WINDOW_ID", "kitty"),
-        ("GHOSTTY_RESOURCES_DIR", "Ghostty"),
-        ("WEZTERM_PANE", "WezTerm"),
-        ("ALACRITTY_WINDOW_ID", "Alacritty"),
-        ("ALACRITTY_SOCKET", "Alacritty"),
-        ("KONSOLE_VERSION", "Konsole"),
-        ("WT_SESSION", "Windows Terminal"),
-    ] {
-        if lookup(variable).is_some() {
-            return Some(label.to_string());
-        }
-    }
-    lookup("TERM").and_then(|term| {
-        let lower = term.to_ascii_lowercase();
-        if lower.contains("kitty") {
-            Some("kitty".to_string())
-        } else if lower.contains("foot") {
-            Some("Foot".to_string())
-        } else if lower.contains("wezterm") {
-            Some("WezTerm".to_string())
+    fn save_workspace(&self) -> Result<()> {
+        let snapshot = if self.clear_workspace_on_exit {
+            WorkspaceSnapshot {
+                version: WORKSPACE_VERSION,
+                active_session: 0,
+                next_session_id: 1,
+                next_group_id: 1,
+                sessions: Vec::new(),
+                group_names: std::collections::HashMap::new(),
+                group_layouts: std::collections::HashMap::new(),
+            }
         } else {
-            None
-        }
-    })
-}
-
-fn terminal_display_name(program: &str) -> String {
-    match program.to_ascii_lowercase().as_str() {
-        "kitty" => "kitty".to_string(),
-        "ghostty" => "Ghostty".to_string(),
-        "wezterm" => "WezTerm".to_string(),
-        "alacritty" => "Alacritty".to_string(),
-        "foot" => "Foot".to_string(),
-        "vscode" => "VS Code".to_string(),
-        "apple_terminal" => "Terminal".to_string(),
-        _ => program.to_string(),
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn detect_terminal_from_process_tree() -> Option<String> {
-    let mut pid = std::process::id();
-    for _ in 0..8 {
-        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
-        let parent = status
-            .lines()
-            .find_map(|line| line.strip_prefix("PPid:\t"))?
-            .trim()
-            .parse::<u32>()
-            .ok()?;
-        if parent == 0 || parent == pid {
-            break;
-        }
-        let command = std::fs::read_to_string(format!("/proc/{parent}/comm"))
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase();
-        for (needle, label) in [
-            ("kitty", "kitty"),
-            ("ghostty", "Ghostty"),
-            ("wezterm", "WezTerm"),
-            ("alacritty", "Alacritty"),
-            ("foot", "Foot"),
-            ("konsole", "Konsole"),
-            ("gnome-terminal", "GNOME Terminal"),
-            ("xfce4-terminal", "Xfce Terminal"),
-            ("tilix", "Tilix"),
-            ("rio", "Rio"),
-        ] {
-            if command.contains(needle) {
-                return Some(label.to_string());
+            WorkspaceSnapshot {
+                version: WORKSPACE_VERSION,
+                active_session: self
+                    .sessions
+                    .get(self.active)
+                    .map_or(0, |session| session.id),
+                next_session_id: self.next_session_id,
+                next_group_id: self.next_group_id,
+                sessions: self
+                    .sessions
+                    .iter()
+                    .map(|session| PersistedSession {
+                        id: session.id,
+                        custom_name: session.custom_name.clone(),
+                        last_command: session.last_command.clone(),
+                        cwd: session
+                            .cwd
+                            .lock()
+                            .map(|cwd| cwd.clone())
+                            .unwrap_or_default(),
+                        group: session.group,
+                        running_command: session
+                            .is_pending()
+                            .then(|| session.last_command.clone())
+                            .flatten(),
+                    })
+                    .collect(),
+                group_names: self.group_names.clone(),
+                group_layouts: self.group_layouts.clone(),
             }
-        }
-        pid = parent;
-    }
-    None
-}
-
-#[cfg(not(target_os = "linux"))]
-fn detect_terminal_from_process_tree() -> Option<String> {
-    None
-}
-
-fn update_cwd_from_osc7(bytes: &[u8], cwd: &Arc<Mutex<PathBuf>>) {
-    let text = String::from_utf8_lossy(bytes);
-    for marker in ["\x1b]7;file://", "\u{9d}7;file://"] {
-        let Some(start) = text.rfind(marker) else {
-            continue;
         };
-        let value = &text[start + marker.len()..];
-        let value = value
-            .split(['\x07', '\x1b', '\u{9c}'])
-            .next()
-            .unwrap_or(value);
-        let path = value
-            .find('/')
-            .map(|index| &value[index..])
-            .unwrap_or(value);
-        if !path.is_empty()
-            && let Ok(mut current) = cwd.lock()
-        {
-            *current = PathBuf::from(path.replace("%20", " "));
-        }
-        break;
-    }
-}
-
-fn pane_geometry(app: &App, terminal: Rect) -> (Vec<(usize, Rect)>, Vec<SplitHit>) {
-    let Some(active) = app.sessions.get(app.active) else {
-        return (Vec::new(), Vec::new());
-    };
-    if let Some(group) = active.group {
-        let fallback = layout_for_group(&app.sessions, group);
-        let layout = app.group_layouts.get(&group).unwrap_or(&fallback);
-        let mut panes = Vec::new();
-        let mut dividers = Vec::new();
-        collect_layout_geometry(
-            layout,
-            terminal,
-            group,
-            &mut Vec::new(),
-            &app.sessions,
-            &mut panes,
-            &mut dividers,
-        );
-        (panes, dividers)
-    } else {
-        (vec![(app.active, terminal)], Vec::new())
-    }
-}
-
-fn pane_areas_for(app: &App, terminal: Rect) -> Vec<(usize, Rect)> {
-    pane_geometry(app, terminal).0
-}
-
-fn collect_layout_geometry(
-    layout: &PaneLayout,
-    area: Rect,
-    group: u64,
-    path: &mut Vec<bool>,
-    sessions: &[Session],
-    panes: &mut Vec<(usize, Rect)>,
-    dividers: &mut Vec<SplitHit>,
-) {
-    match layout {
-        PaneLayout::Leaf(id) => {
-            if let Some(index) = sessions.iter().position(|session| session.id == *id) {
-                panes.push((index, area));
-            }
-        }
-        PaneLayout::Split {
-            axis,
-            ratio,
-            first,
-            second,
-        } => {
-            let total = match axis {
-                SplitAxis::Horizontal => area.width,
-                SplitAxis::Vertical => area.height,
-            };
-            let usable = total.saturating_sub(1);
-            let first_len = if usable >= 2 {
-                (((u32::from(usable) * u32::from(*ratio)) / 100) as u16).clamp(1, usable - 1)
-            } else {
-                usable
-            };
-            let second_len = usable.saturating_sub(first_len);
-            let (first_area, divider, second_area) = match axis {
-                SplitAxis::Horizontal => (
-                    Rect::new(area.x, area.y, first_len, area.height),
-                    Rect::new(area.x + first_len, area.y, 1, area.height),
-                    Rect::new(area.x + first_len + 1, area.y, second_len, area.height),
-                ),
-                SplitAxis::Vertical => (
-                    Rect::new(area.x, area.y, area.width, first_len),
-                    Rect::new(area.x, area.y + first_len, area.width, 1),
-                    Rect::new(area.x, area.y + first_len + 1, area.width, second_len),
-                ),
-            };
-            dividers.push(SplitHit {
-                group,
-                path: path.clone(),
-                axis: *axis,
-                divider,
-                container: area,
-            });
-            path.push(false);
-            collect_layout_geometry(first, first_area, group, path, sessions, panes, dividers);
-            path.pop();
-            path.push(true);
-            collect_layout_geometry(second, second_area, group, path, sessions, panes, dividers);
-            path.pop();
-        }
-    }
-}
-
-fn layout_for_group(sessions: &[Session], group: u64) -> PaneLayout {
-    balanced_layout(sessions, group, SplitAxis::Horizontal)
-}
-
-fn balanced_layout(sessions: &[Session], group: u64, axis: SplitAxis) -> PaneLayout {
-    let ids: Vec<u64> = sessions
-        .iter()
-        .filter(|session| session.group == Some(group))
-        .map(|session| session.id)
-        .collect();
-    balanced_layout_ids(&ids, axis)
-}
-
-fn balanced_layout_ids(ids: &[u64], axis: SplitAxis) -> PaneLayout {
-    if ids.len() <= 1 {
-        return PaneLayout::Leaf(ids.first().copied().unwrap_or_default());
-    }
-    let midpoint = ids.len().div_ceil(2);
-    PaneLayout::Split {
-        axis,
-        ratio: ((midpoint * 100) / ids.len()) as u16,
-        first: Box::new(balanced_layout_ids(&ids[..midpoint], axis)),
-        second: Box::new(balanced_layout_ids(&ids[midpoint..], axis)),
-    }
-}
-
-fn remove_layout_leaf(layout: PaneLayout, id: u64) -> Option<PaneLayout> {
-    match layout {
-        PaneLayout::Leaf(leaf) => (leaf != id).then_some(PaneLayout::Leaf(leaf)),
-        PaneLayout::Split {
-            axis,
-            ratio,
-            first,
-            second,
-        } => match (
-            remove_layout_leaf(*first, id),
-            remove_layout_leaf(*second, id),
-        ) {
-            (Some(first), Some(second)) => Some(PaneLayout::Split {
-                axis,
-                ratio,
-                first: Box::new(first),
-                second: Box::new(second),
-            }),
-            (Some(layout), None) | (None, Some(layout)) => Some(layout),
-            (None, None) => None,
-        },
-    }
-}
-
-fn equalize_layout(layout: &mut PaneLayout) {
-    if let PaneLayout::Split {
-        ratio,
-        first,
-        second,
-        ..
-    } = layout
-    {
-        *ratio = 50;
-        equalize_layout(first);
-        equalize_layout(second);
-    }
-}
-
-fn insert_layout_leaf(layout: &mut PaneLayout, target: u64, pane: u64, axis: SplitAxis) -> bool {
-    if matches!(layout, PaneLayout::Leaf(id) if *id == target) {
-        *layout = PaneLayout::Split {
-            axis,
-            ratio: 50,
-            first: Box::new(PaneLayout::Leaf(target)),
-            second: Box::new(PaneLayout::Leaf(pane)),
-        };
-        return true;
-    }
-    match layout {
-        PaneLayout::Split { first, second, .. } => {
-            insert_layout_leaf(first, target, pane, axis)
-                || insert_layout_leaf(second, target, pane, axis)
-        }
-        PaneLayout::Leaf(_) => false,
-    }
-}
-
-fn layout_at_path_mut<'a>(layout: &'a mut PaneLayout, path: &[bool]) -> Option<&'a mut PaneLayout> {
-    if path.is_empty() {
-        return Some(layout);
-    }
-    match layout {
-        PaneLayout::Split { first, second, .. } => {
-            layout_at_path_mut(if path[0] { second } else { first }, &path[1..])
-        }
-        PaneLayout::Leaf(_) => None,
+        write_workspace_snapshot(&snapshot)
     }
 }
 
@@ -1346,501 +1274,25 @@ fn top_level_units(app: &App) -> Vec<usize> {
     units
 }
 
-fn terminal_area(area: Rect, collapsed: bool) -> Rect {
-    let width = if collapsed {
-        COLLAPSED_WIDTH
-    } else {
-        SIDEBAR_WIDTH
-    };
-    let [_, terminal] =
-        Layout::horizontal([Constraint::Length(width), Constraint::Min(1)]).areas(area);
-    terminal
-}
-
-fn contains(area: Rect, x: u16, y: u16) -> bool {
-    area.width > 0
-        && area.height > 0
-        && x >= area.x
-        && x < area.right()
-        && y >= area.y
-        && y < area.bottom()
-}
-
-fn encode_key(key: KeyEvent) -> Option<Vec<u8>> {
-    let bytes = match key.code {
-        KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            vec![(c.to_ascii_lowercase() as u8) & 0x1f]
-        }
-        KeyCode::Char(c) => c.to_string().into_bytes(),
-        KeyCode::Enter => b"\r".to_vec(),
-        KeyCode::Tab => b"\t".to_vec(),
-        KeyCode::BackTab => b"\x1b[Z".to_vec(),
-        KeyCode::Backspace => vec![0x7f],
-        KeyCode::Esc => vec![0x1b],
-        KeyCode::Up => b"\x1b[A".to_vec(),
-        KeyCode::Down => b"\x1b[B".to_vec(),
-        KeyCode::Right => b"\x1b[C".to_vec(),
-        KeyCode::Left => b"\x1b[D".to_vec(),
-        KeyCode::Home => b"\x1b[H".to_vec(),
-        KeyCode::End => b"\x1b[F".to_vec(),
-        KeyCode::PageUp => b"\x1b[5~".to_vec(),
-        KeyCode::PageDown => b"\x1b[6~".to_vec(),
-        KeyCode::Delete => b"\x1b[3~".to_vec(),
-        KeyCode::Insert => b"\x1b[2~".to_vec(),
-        KeyCode::F(n) => format!("\x1b[{}~", 10 + n).into_bytes(),
-        _ => return None,
-    };
-    Some(if key.modifiers.contains(KeyModifiers::ALT) {
-        [vec![0x1b], bytes].concat()
-    } else {
-        bytes
-    })
-}
-
-struct TerminalView<'a>(&'a vt100::Screen);
-
-impl Widget for TerminalView<'_> {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        let rows = area.height.min(self.0.size().0);
-        let cols = area.width.min(self.0.size().1);
-        for row in 0..rows {
-            for col in 0..cols {
-                let Some(cell) = self.0.cell(row, col) else {
-                    continue;
-                };
-                let mut style = Style::default()
-                    .fg(vt_color(cell.fgcolor()))
-                    .bg(vt_color(cell.bgcolor()));
-                if cell.bold() {
-                    style = style.add_modifier(Modifier::BOLD);
-                }
-                if cell.italic() {
-                    style = style.add_modifier(Modifier::ITALIC);
-                }
-                if cell.underline() {
-                    style = style.add_modifier(Modifier::UNDERLINED);
-                }
-                if cell.inverse() {
-                    style = style.add_modifier(Modifier::REVERSED);
-                }
-                let symbol = if cell.contents().is_empty() {
-                    " "
-                } else {
-                    cell.contents()
-                };
-                buf[(area.x + col, area.y + row)]
-                    .set_symbol(symbol)
-                    .set_style(style);
-            }
-        }
+fn collapsed_sidebar_label(app: &App, index: usize) -> String {
+    let units = top_level_units(app);
+    let session = &app.sessions[index];
+    let unit_position = units.iter().position(|unit_index| {
+        *unit_index == index
+            || session.group.is_some()
+                && app.sessions.get(*unit_index).and_then(|unit| unit.group) == session.group
+    });
+    let is_group_child = session
+        .group
+        .is_some_and(|_| unit_position.is_some_and(|position| units[position] != index));
+    if is_group_child {
+        return " · ".to_string();
     }
-}
-
-fn vt_color(color: vt100::Color) -> Color {
-    match color {
-        vt100::Color::Default => Color::Reset,
-        vt100::Color::Idx(i) => Color::Indexed(i),
-        vt100::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
-    }
-}
-
-fn render(frame: &mut Frame, app: &mut App) {
-    app.spinner_tick = app.spinner_tick.wrapping_add(1);
-    let area = frame.area();
-    let sidebar_w = if app.sidebar_collapsed {
-        COLLAPSED_WIDTH
-    } else {
-        SIDEBAR_WIDTH
-    };
-    let [sidebar, terminal] =
-        Layout::horizontal([Constraint::Length(sidebar_w), Constraint::Min(1)]).areas(area);
-    app.hits.sidebar = sidebar;
-    app.hits.terminal = terminal;
-    app.hits.tabs.clear();
-    app.hits.panes.clear();
-    app.hits.groups.clear();
-    app.hits.split_dividers.clear();
-    app.hits.confirm_yes = Rect::default();
-    app.hits.confirm_no = Rect::default();
-
-    let divider = Style::default().fg(Color::Rgb(55, 58, 74));
-    for y in sidebar.y..sidebar.bottom() {
-        if sidebar.width > 0 {
-            frame.buffer_mut()[(sidebar.right() - 1, y)]
-                .set_symbol("│")
-                .set_style(divider);
-        }
-    }
-
-    if app.sidebar_collapsed {
-        for (index, _) in app
-            .sessions
-            .iter()
-            .enumerate()
-            .take(sidebar.height.saturating_sub(2) as usize)
-        {
-            let active = index == app.active;
-            let line = Line::from(Span::styled(
-                format!(" {} ", index + 1),
-                if active {
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Rgb(131, 166, 229))
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::DarkGray)
-                },
-            ));
-            frame.render_widget(
-                Paragraph::new(line),
-                Rect::new(
-                    sidebar.x,
-                    sidebar.y + 2 + index as u16,
-                    sidebar.width.saturating_sub(1),
-                    1,
-                ),
-            );
-            app.hits.tabs.push(TabHit {
-                index,
-                body: Rect::new(
-                    sidebar.x,
-                    sidebar.y + 2 + index as u16,
-                    sidebar.width.saturating_sub(1),
-                    1,
-                ),
-                close: Rect::default(),
-            });
-        }
-    } else {
-        let title = Line::from(Span::styled(
-            format!(" {}", app.host_terminal),
-            Style::default()
-                .fg(Color::Rgb(131, 138, 166))
-                .add_modifier(Modifier::BOLD),
-        ));
-        frame.render_widget(
-            Paragraph::new(title),
-            Rect::new(sidebar.x, sidebar.y, sidebar.width.saturating_sub(1), 1),
-        );
-        app.hits.plus = Rect::new(sidebar.right().saturating_sub(3), sidebar.y, 2, 1);
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                "+",
-                Style::default()
-                    .fg(Color::Rgb(131, 166, 229))
-                    .add_modifier(Modifier::BOLD),
-            )))
-            .alignment(ratatui::layout::Alignment::Right),
-            Rect::new(sidebar.x, sidebar.y, sidebar.width.saturating_sub(1), 1),
-        );
-
-        let mut row = sidebar.y + 2;
-        let mut previous_group = None;
-        let order = sidebar_order(app);
-        for (order_position, index) in order.iter().copied().enumerate() {
-            let session = &app.sessions[index];
-            if row + 2 >= sidebar.bottom().saturating_sub(1) {
-                break;
-            }
-            if session.group.is_some() && session.group != previous_group {
-                let group = session.group.unwrap_or_default();
-                frame.render_widget(
-                    Paragraph::new(Line::from(vec![
-                        Span::styled(" ▾ ", Style::default().fg(Color::Rgb(110, 115, 141))),
-                        Span::styled(
-                            app.group_name(group),
-                            Style::default()
-                                .fg(Color::Rgb(137, 180, 250))
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                    ])),
-                    Rect::new(sidebar.x, row, sidebar.width.saturating_sub(1), 1),
-                );
-                app.hits.groups.push((
-                    group,
-                    Rect::new(sidebar.x, row, sidebar.width.saturating_sub(1), 1),
-                ));
-                row += 1;
-            }
-            previous_group = session.group;
-            let grouped = session.group.is_some();
-            let group_continues = session.group.is_some()
-                && order
-                    .get(order_position + 1)
-                    .and_then(|next| app.sessions.get(*next))
-                    .is_some_and(|next| next.group == session.group);
-            let active = index == app.active;
-            let style = if active {
-                Style::default()
-                    .fg(Color::Rgb(205, 211, 240))
-                    .bg(Color::Rgb(35, 36, 54))
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::Rgb(166, 173, 200))
-            };
-            let status = if session.is_pending() {
-                ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"][(app.spinner_tick / 5) % 10]
-            } else {
-                " "
-            };
-            let tree_prefix = if grouped { " │ " } else { " " };
-            let first_line = Line::from(vec![
-                Span::styled(tree_prefix, Style::default().fg(Color::Rgb(110, 115, 141))),
-                Span::styled(
-                    format!("{status} "),
-                    Style::default().fg(Color::Rgb(137, 180, 250)),
-                ),
-                Span::styled(
-                    truncate(
-                        session.display_name(),
-                        sidebar.width.saturating_sub(if grouped { 8 } else { 6 }) as usize,
-                    ),
-                    style,
-                ),
-            ]);
-            frame.render_widget(
-                Paragraph::new(first_line).style(style),
-                Rect::new(sidebar.x, row, sidebar.width.saturating_sub(1), 1),
-            );
-            let close = Rect::new(sidebar.right().saturating_sub(4), row, 2, 1);
-            frame.render_widget(
-                Paragraph::new(Span::styled(
-                    "×",
-                    Style::default().fg(Color::Rgb(137, 180, 250)),
-                ))
-                .alignment(ratatui::layout::Alignment::Right),
-                close,
-            );
-            frame.render_widget(
-                Paragraph::new(Line::from(vec![
-                    Span::styled(
-                        if grouped && group_continues {
-                            " │   "
-                        } else if grouped {
-                            " └   "
-                        } else {
-                            "   "
-                        },
-                        Style::default().fg(Color::Rgb(110, 115, 141)),
-                    ),
-                    Span::styled(
-                        compact_path(
-                            &session.directory_label(),
-                            sidebar.width.saturating_sub(if grouped { 6 } else { 4 }) as usize,
-                        ),
-                        Style::default().fg(Color::Rgb(110, 115, 141)),
-                    ),
-                ]))
-                .style(style),
-                Rect::new(sidebar.x, row + 1, sidebar.width.saturating_sub(1), 1),
-            );
-            app.hits.tabs.push(TabHit {
-                index,
-                body: Rect::new(sidebar.x, row, sidebar.width.saturating_sub(1), 2),
-                close,
-            });
-            row += 2;
-        }
-    }
-
-    let toggle_text = if app.sidebar_collapsed { "»" } else { "«" };
-    app.hits.toggle = Rect::new(
-        sidebar.right().saturating_sub(3),
-        sidebar.bottom().saturating_sub(1),
-        2,
-        1,
-    );
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            toggle_text,
-            Style::default().fg(Color::Rgb(131, 138, 166)),
-        )))
-        .alignment(ratatui::layout::Alignment::Right),
-        Rect::new(
-            sidebar.x,
-            sidebar.bottom().saturating_sub(1),
-            sidebar.width.saturating_sub(1),
-            1,
-        ),
-    );
-
-    let (panes, split_dividers) = pane_geometry(app, terminal);
-    for hit in &split_dividers {
-        let symbol = match hit.axis {
-            SplitAxis::Horizontal => "│",
-            SplitAxis::Vertical => "─",
-        };
-        for y in hit.divider.y..hit.divider.bottom() {
-            for x in hit.divider.x..hit.divider.right() {
-                frame.buffer_mut()[(x, y)]
-                    .set_symbol(symbol)
-                    .set_style(Style::default().fg(Color::Rgb(69, 71, 90)));
-            }
-        }
-    }
-    app.hits.split_dividers = split_dividers;
-    for (index, area) in panes.iter().copied() {
-        app.hits.panes.push((index, area));
-        if let Some(session) = app.sessions.get(index)
-            && let Ok(parser) = session.parser.lock()
-        {
-            frame.render_widget(TerminalView(parser.screen()), area);
-            if index == app.active {
-                let (row, col) = parser.screen().cursor_position();
-                if col < area.width && row < area.height {
-                    frame.set_cursor_position((area.x + col, area.y + row));
-                }
-            }
-        }
-    }
-
-    if app
-        .prefix_started
-        .is_some_and(|started| started.elapsed() <= Duration::from_secs(1))
-    {
-        let hint = " prefix: 1-0 tab  ←/→ cycle  h/j/k/l pane  T new  W close  s sidebar ";
-        let width = hint.chars().count().min(terminal.width as usize) as u16;
-        let hint_area = Rect::new(
-            terminal.right().saturating_sub(width),
-            terminal.bottom().saturating_sub(1),
-            width,
-            1,
-        );
-        frame.render_widget(
-            Paragraph::new(hint).style(
-                Style::default()
-                    .fg(Color::Rgb(24, 24, 37))
-                    .bg(Color::Rgb(137, 180, 250))
-                    .add_modifier(Modifier::BOLD),
-            ),
-            hint_area,
-        );
-    }
-
-    if let Some(menu) = &app.context_menu {
-        frame.render_widget(Clear, menu.area);
-        frame.render_widget(
-            Paragraph::new(
-                menu.entries
-                    .iter()
-                    .map(|(label, _)| Line::from(format!(" {label}")))
-                    .collect::<Vec<_>>(),
-            )
-            .block(Block::default().borders(Borders::ALL).border_style(divider))
-            .style(
-                Style::default()
-                    .bg(Color::Rgb(24, 24, 37))
-                    .fg(Color::Rgb(205, 214, 244)),
-            ),
-            menu.area,
-        );
-    }
-
-    let rename = match &app.input_mode {
-        InputMode::Rename { value, .. } => Some((value, " Rename tab ")),
-        InputMode::RenameGroup { value, .. } => Some((value, " Rename group ")),
-        _ => None,
-    };
-    if let Some((value, title)) = rename {
-        let width = 42.min(area.width.saturating_sub(4));
-        let popup = Rect::new(
-            area.x + (area.width.saturating_sub(width)) / 2,
-            area.y + area.height.saturating_sub(3) / 2,
-            width,
-            3,
-        );
-        frame.render_widget(Clear, popup);
-        frame.render_widget(
-            Paragraph::new(value.as_str())
-                .block(
-                    Block::default()
-                        .title(title)
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::Rgb(137, 180, 250))),
-                )
-                .style(
-                    Style::default()
-                        .bg(Color::Rgb(24, 24, 37))
-                        .fg(Color::Rgb(205, 214, 244)),
-                ),
-            popup,
-        );
-        frame.set_cursor_position((
-            popup.x
-                + 1
-                + value
-                    .chars()
-                    .count()
-                    .min(popup.width.saturating_sub(3) as usize) as u16,
-            popup.y + 1,
-        ));
-    }
-
-    if let InputMode::ConfirmClose { session_id } = &app.input_mode {
-        let exits_workspace = app.sessions.len() == 1;
-        let label = app
-            .sessions
-            .iter()
-            .find(|session| session.id == *session_id)
-            .map(Session::display_name)
-            .unwrap_or("tab");
-        let width = 52.min(area.width.saturating_sub(4));
-        let popup = Rect::new(
-            area.x + (area.width.saturating_sub(width)) / 2,
-            area.y + area.height.saturating_sub(7) / 2,
-            width,
-            7,
-        );
-        frame.render_widget(Clear, popup);
-        frame.render_widget(
-            Paragraph::new(vec![
-                Line::from(""),
-                Line::from(if exits_workspace {
-                    " Exit this workspace?".to_string()
-                } else {
-                    format!(
-                        " Close “{}”?",
-                        truncate(label, width.saturating_sub(12) as usize)
-                    )
-                }),
-                Line::from(if exits_workspace {
-                    " This is the last tab. Are you sure?"
-                } else {
-                    " A command is still running. Are you sure?"
-                }),
-                Line::from(""),
-                Line::from(vec![
-                    Span::styled(
-                        if exits_workspace {
-                            "   Exit [Y]    "
-                        } else {
-                            "   Close [Y]   "
-                        },
-                        Style::default()
-                            .fg(Color::Rgb(243, 139, 168))
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        " Cancel [N] ",
-                        Style::default().fg(Color::Rgb(166, 173, 200)),
-                    ),
-                ]),
-            ])
-            .block(
-                Block::default()
-                    .title(" Confirm close ")
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Rgb(243, 139, 168))),
-            )
-            .style(
-                Style::default()
-                    .bg(Color::Rgb(24, 24, 37))
-                    .fg(Color::Rgb(205, 214, 244)),
-            ),
-            popup,
-        );
-        app.hits.confirm_yes = Rect::new(popup.x + 3, popup.y + 5, 15, 1);
-        app.hits.confirm_no = Rect::new(popup.x + 18, popup.y + 5, 12, 1);
+    match unit_position {
+        Some(position @ 0..=8) => format!(" {} ", position + 1),
+        Some(9) => " 0 ".to_string(),
+        Some(_) => " · ".to_string(),
+        None => "   ".to_string(),
     }
 }
 
@@ -1941,7 +1393,130 @@ impl Drop for TerminalGuard {
     }
 }
 
+fn query_host_terminal_bg() -> Option<(u8, u8, u8)> {
+    let mut tty = fs::File::open("/dev/tty").ok()?;
+    let fd = tty.as_raw_fd();
+
+    // Send OSC 11 query to /dev/tty (the host terminal)
+    let query = b"\x1b]11;?\x1b\x5c";
+    let mut poll_stdout = io::stdout();
+    let _ = poll_stdout.write_all(query);
+    let _ = poll_stdout.flush();
+
+    let mut buf = [0u8; 512];
+    let mut accumulated = Vec::new();
+    let deadline = Instant::now() + Duration::from_millis(200);
+
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ret = unsafe { libc::poll(&mut pfd, 1, remaining.as_millis() as _) };
+        if ret < 0 {
+            // EINTR – retry
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
+        if ret == 0 {
+            break;
+        }
+        match tty.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                accumulated.extend_from_slice(&buf[..n]);
+                // Only stop when we see a complete OSC terminator:
+                // either trailing BEL (0x07) or trailing ST (0x1b 0x5c)
+                if accumulated.ends_with(&[0x07])
+                    || accumulated.ends_with(&[0x1b, 0x5c])
+                {
+                    break;
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    parse_osc_color_response(&accumulated, 11)
+}
+
+fn parse_osc_color_response(data: &[u8], osc_num: u8) -> Option<(u8, u8, u8)> {
+    let s = std::str::from_utf8(data).ok()?;
+    let prefix = format!("\x1b]{};rgb:", osc_num);
+    let start = s.find(&prefix)?;
+    let rest = &s[start + prefix.len()..];
+    let end = rest.find(|c| c == '\x07' || c == '\x1b').unwrap_or(rest.len());
+    let color_str = &rest[..end];
+    let parts: Vec<&str> = color_str.split('/').collect();
+    if parts.len() < 3 {
+        return None;
+    }
+    let r = u16::from_str_radix(parts[0], 16).ok()?;
+    let g = u16::from_str_radix(parts[1], 16).ok()?;
+    let b = u16::from_str_radix(parts[2], 16).ok()?;
+    // Convert from 16-bit (0-65535) or 8-bit (0-255) range to 8-bit
+    let to_u8 = |v: u16| if v > 255 { (v >> 8) as u8 } else { v as u8 };
+    Some((to_u8(r), to_u8(g), to_u8(b)))
+}
+
+fn respond_to_osc_queries(data: &[u8], writer: &mut dyn Write, host_bg: Option<(u8, u8, u8)>) {
+    let bg = host_bg.unwrap_or((30, 30, 30)); // fallback dark gray
+    // Check for OSC 10 or 11 query (\x1b]10;? or \x1b]11;? terminated by \x07 or \x1b\\)
+    let mut i = 0;
+    while i < data.len() {
+        if data[i] == 0x1b && i + 1 < data.len() && data[i + 1] == b']' {
+            // Find the OSC number
+            let start = i + 2;
+            if start < data.len() && (data[start] == b'1' || data[start] == b'0') {
+                let mut osc_end = start;
+                while osc_end < data.len() && data[osc_end] != b';' {
+                    osc_end += 1;
+                }
+                if osc_end < data.len() {
+                    let num_str = std::str::from_utf8(&data[start..osc_end]).ok();
+                    if matches!(num_str, Some("10") | Some("11")) {
+                        // Check for ? query after ;
+                        let q_start = osc_end + 1;
+                        if q_start < data.len() && data[q_start] == b'?' {
+                            // Check for terminator
+                            let mut term_start = q_start + 1;
+                            while term_start < data.len() {
+                                if data[term_start] == 0x07
+                                    || (data[term_start] == 0x1b
+                                        && term_start + 1 < data.len()
+                                        && data[term_start + 1] == b'\\')
+                                {
+                                    // Found complete query - respond
+                                    let (_r, _g, _b) = bg;
+                                    let response = format!(
+                                        "\x1b]{};rgb:{:02x}{:02x}/{:02x}{:02x}/{:02x}{:02x}\x1b\x5c",
+                                        num_str.unwrap(),
+                                        _r, _r, _g, _g, _b, _b
+                                    );
+                                    let _ = writer.write_all(response.as_bytes());
+                                    let _ = writer.flush();
+                                    break;
+                                }
+                                term_start += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+}
+
 fn main() -> Result<()> {
+    let host_bg = query_host_terminal_bg();
     enable_raw_mode()?;
     execute!(
         io::stdout(),
@@ -1952,7 +1527,7 @@ fn main() -> Result<()> {
     let _guard = TerminalGuard;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
-    let mut app = App::new(terminal.size()?.into())?;
+    let mut app = App::new(terminal.size()?.into(), host_bg)?;
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         loop {
@@ -1965,6 +1540,7 @@ fn main() -> Result<()> {
     });
 
     let mut last_draw = Instant::now();
+    let mut last_save = Instant::now();
     loop {
         if app.exit_requested {
             break;
@@ -1977,6 +1553,10 @@ fn main() -> Result<()> {
             terminal.draw(|frame| render(frame, &mut app))?;
             last_draw = Instant::now();
         }
+        if last_save.elapsed() >= Duration::from_millis(500) {
+            let _ = app.save_workspace();
+            last_save = Instant::now();
+        }
         match rx.recv_timeout(Duration::from_millis(8)) {
             Ok(Event::Key(key)) if app.handle_key(key)? => break,
             Ok(Event::Mouse(mouse)) => app.handle_mouse(mouse)?,
@@ -1986,161 +1566,9 @@ fn main() -> Result<()> {
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
+    app.save_workspace()?;
     Ok(())
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn expanded_and_collapsed_layout_reserve_expected_width() {
-        let area = Rect::new(0, 0, 120, 40);
-        assert_eq!(
-            terminal_area(area, false),
-            Rect::new(SIDEBAR_WIDTH, 0, 91, 40)
-        );
-        assert_eq!(
-            terminal_area(area, true),
-            Rect::new(COLLAPSED_WIDTH, 0, 116, 40)
-        );
-    }
-
-    #[test]
-    fn hit_testing_excludes_right_and_bottom_edges() {
-        let area = Rect::new(5, 7, 10, 4);
-        assert!(contains(area, 5, 7));
-        assert!(contains(area, 14, 10));
-        assert!(!contains(area, 15, 10));
-        assert!(!contains(area, 14, 11));
-    }
-
-    #[test]
-    fn control_keys_are_forwarded_as_terminal_bytes() {
-        let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        assert_eq!(encode_key(key), Some(vec![3]));
-    }
-
-    #[test]
-    fn custom_name_overrides_command_until_cleared() {
-        assert_eq!(display_name_for(None, None), "New Tab");
-        assert_eq!(display_name_for(None, Some("cargo test")), "cargo test");
-        assert_eq!(
-            display_name_for(Some("server"), Some("cargo test")),
-            "server"
-        );
-    }
-
-    #[test]
-    fn osc7_updates_the_displayed_directory() {
-        let cwd = Arc::new(Mutex::new(PathBuf::from("/old")));
-        update_cwd_from_osc7(b"\x1b]7;file://host/home/user/project\x07", &cwd);
-        assert_eq!(*cwd.lock().unwrap(), PathBuf::from("/home/user/project"));
-    }
-
-    #[test]
-    fn long_tab_labels_are_ellipsized() {
-        assert_eq!(truncate("cargo test --workspace", 10), "cargo tes…");
-    }
-
-    #[test]
-    fn compacted_paths_prioritize_the_final_directory() {
-        let compacted = compact_path("~/Projects/client/packages/frontend/src", 22);
-        assert!(compacted.chars().count() <= 22);
-        assert!(compacted.ends_with("src"));
-        assert!(compacted.contains('…'));
-    }
-
-    #[test]
-    fn paths_that_fit_are_not_compacted() {
-        assert_eq!(compact_path("~/Projects/app", 20), "~/Projects/app");
-    }
-
-    #[test]
-    fn pane_groups_use_default_or_custom_names() {
-        let mut names = std::collections::HashMap::new();
-        assert_eq!(group_display_name(&names, 3), "Group 3");
-        names.insert(3, "Backend".to_string());
-        assert_eq!(group_display_name(&names, 3), "Backend");
-    }
-
-    #[test]
-    fn balanced_layout_uses_requested_orientation_and_all_panes() {
-        let layout = balanced_layout_ids(&[1, 2, 3, 4], SplitAxis::Vertical);
-        let PaneLayout::Split { axis, .. } = &layout else {
-            panic!("multiple panes should create a split");
-        };
-        assert_eq!(*axis, SplitAxis::Vertical);
-        assert_eq!(layout_leaf_ids(&layout), vec![1, 2, 3, 4]);
-    }
-
-    #[test]
-    fn a_group_layout_can_contain_one_pane() {
-        let layout = balanced_layout_ids(&[42], SplitAxis::Horizontal);
-        assert_eq!(layout_leaf_ids(&layout), vec![42]);
-        assert!(matches!(layout, PaneLayout::Leaf(42)));
-    }
-
-    #[test]
-    fn removing_a_layout_leaf_collapses_its_empty_split() {
-        let layout = balanced_layout_ids(&[1, 2, 3], SplitAxis::Horizontal);
-        let layout = remove_layout_leaf(layout, 2).expect("other panes remain");
-        assert_eq!(layout_leaf_ids(&layout), vec![1, 3]);
-    }
-
-    #[test]
-    fn pane_can_be_inserted_below_a_specific_target() {
-        let mut layout = balanced_layout_ids(&[1, 2, 3, 4], SplitAxis::Horizontal);
-        let layout_without_four = remove_layout_leaf(layout, 4).expect("other panes remain");
-        layout = layout_without_four;
-        assert!(insert_layout_leaf(&mut layout, 3, 4, SplitAxis::Vertical));
-        let PaneLayout::Split {
-            axis: root_axis,
-            second,
-            ..
-        } = &layout
-        else {
-            panic!("expected root split");
-        };
-        assert_eq!(*root_axis, SplitAxis::Horizontal);
-        let PaneLayout::Split {
-            axis: branch_axis, ..
-        } = second.as_ref()
-        else {
-            panic!("expected nested split");
-        };
-        assert_eq!(*branch_axis, SplitAxis::Vertical);
-        assert_eq!(layout_leaf_ids(&layout), vec![1, 2, 3, 4]);
-    }
-
-    #[test]
-    fn host_terminal_uses_explicit_environment_markers() {
-        let variables =
-            std::collections::HashMap::from([("WEZTERM_PANE".to_string(), "7".to_string())]);
-        assert_eq!(
-            detect_terminal_from_env(|name| variables.get(name).cloned()),
-            Some("WezTerm".to_string())
-        );
-    }
-
-    #[test]
-    fn term_program_names_are_normalized_for_display() {
-        let variables =
-            std::collections::HashMap::from([("TERM_PROGRAM".to_string(), "vscode".to_string())]);
-        assert_eq!(
-            detect_terminal_from_env(|name| variables.get(name).cloned()),
-            Some("VS Code".to_string())
-        );
-    }
-
-    fn layout_leaf_ids(layout: &PaneLayout) -> Vec<u64> {
-        match layout {
-            PaneLayout::Leaf(id) => vec![*id],
-            PaneLayout::Split { first, second, .. } => {
-                let mut ids = layout_leaf_ids(first);
-                ids.extend(layout_leaf_ids(second));
-                ids
-            }
-        }
-    }
-}
+mod tests;

@@ -56,5 +56,22 @@ Keyboard shortcuts:
 The prefix remains active for one second and displays an on-screen key hint.
 Pane groups count as one item for numbered and left/right navigation.
 
+## Persistence
+
+Plexr automatically saves the workspace every 500 ms and restores it on the
+next launch. The snapshot includes tabs, custom names, directories, groups,
+nested pane layouts, split ratios, and the focused tab. Commands that still own
+their terminal when Plexr exits are relaunched in their restored tabs.
+
+The snapshot is written atomically to:
+
+```text
+$XDG_STATE_HOME/plexr/workspace.json
+```
+
+When `XDG_STATE_HOME` is unset, Plexr uses
+`~/.local/state/plexr/workspace.json`. `Ctrl-Q` preserves the workspace;
+explicitly closing the final tab clears it before Plexr exits.
+
 This project adapts Herdr's layout, styling, and PTY approach and is therefore
 licensed under AGPL-3.0-or-later.
