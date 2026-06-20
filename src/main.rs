@@ -212,14 +212,13 @@ enum MenuAction {
     ClearGroupName(u64),
     LayoutHorizontal(u64),
     LayoutVertical(u64),
-    SetPaneSplitAxis {
-        group: u64,
+    PlaceRelative {
+        target: u64,
         pane: u64,
         axis: SplitAxis,
     },
     EqualizeGroup(u64),
     CreateGroup,
-    AddToGroup(u64),
     RemoveFromGroup,
     Ungroup(u64),
     Close,
@@ -465,28 +464,13 @@ impl App {
     }
 
     fn cleanup_groups(&mut self) {
-        let groups: Vec<u64> = self
+        let groups: std::collections::HashSet<u64> = self
             .sessions
             .iter()
             .filter_map(|session| session.group)
             .collect();
-        for group in groups {
-            if self
-                .sessions
-                .iter()
-                .filter(|session| session.group == Some(group))
-                .count()
-                < 2
-            {
-                for session in &mut self.sessions {
-                    if session.group == Some(group) {
-                        session.group = None;
-                    }
-                }
-                self.group_names.remove(&group);
-                self.group_layouts.remove(&group);
-            }
-        }
+        self.group_names.retain(|group, _| groups.contains(group));
+        self.group_layouts.retain(|group, _| groups.contains(group));
     }
 
     fn open_context_menu(&mut self, index: usize, x: u16, y: u16) {
@@ -497,51 +481,67 @@ impl App {
         if session.custom_name.is_some() {
             entries.push(("Clear custom name".into(), MenuAction::ClearName));
         }
-        if let Some(group) = session.group {
-            entries.push(("Rename group".into(), MenuAction::RenameGroup(group)));
-            if self.group_names.contains_key(&group) {
-                entries.push(("Clear group name".into(), MenuAction::ClearGroupName(group)));
-            }
+        if session.group.is_some() {
             entries.push(("Remove from group".into(), MenuAction::RemoveFromGroup));
-            entries.push(("Ungroup full group".into(), MenuAction::Ungroup(group)));
+        } else {
+            entries.push(("Create pane group".into(), MenuAction::CreateGroup));
+        }
+        if index != self.active {
+            let target = self.sessions[self.active].id;
             entries.push((
-                "Split with sibling side by side".into(),
-                MenuAction::SetPaneSplitAxis {
-                    group,
+                "Place beside current pane".into(),
+                MenuAction::PlaceRelative {
+                    target,
                     pane: session.id,
                     axis: SplitAxis::Horizontal,
                 },
             ));
             entries.push((
-                "Split with sibling top/bottom".into(),
-                MenuAction::SetPaneSplitAxis {
-                    group,
+                "Place below current pane".into(),
+                MenuAction::PlaceRelative {
+                    target,
                     pane: session.id,
                     axis: SplitAxis::Vertical,
                 },
             ));
-            entries.push((
-                "Tile side by side".into(),
-                MenuAction::LayoutHorizontal(group),
-            ));
-            entries.push((
-                "Tile top and bottom".into(),
-                MenuAction::LayoutVertical(group),
-            ));
-            entries.push(("Equalize panes".into(), MenuAction::EqualizeGroup(group)));
-        } else {
-            entries.push(("Create pane group".into(), MenuAction::CreateGroup));
-            let mut groups: Vec<u64> = self.sessions.iter().filter_map(|s| s.group).collect();
-            groups.sort_unstable();
-            groups.dedup();
-            entries.extend(groups.into_iter().map(|group| {
-                (
-                    format!("Add to {}", self.group_name(group)),
-                    MenuAction::AddToGroup(group),
-                )
-            }));
         }
         entries.push(("Close tab".into(), MenuAction::Close));
+        self.show_context_menu(session.id, entries, x, y);
+    }
+
+    fn open_group_context_menu(&mut self, group: u64, x: u16, y: u16) {
+        let Some(session_id) = self
+            .sessions
+            .iter()
+            .find(|session| session.group == Some(group))
+            .map(|session| session.id)
+        else {
+            return;
+        };
+        let mut entries = vec![("Rename group".into(), MenuAction::RenameGroup(group))];
+        if self.group_names.contains_key(&group) {
+            entries.push(("Clear group name".into(), MenuAction::ClearGroupName(group)));
+        }
+        entries.push(("Ungroup".into(), MenuAction::Ungroup(group)));
+        entries.push((
+            "Tile side by side".into(),
+            MenuAction::LayoutHorizontal(group),
+        ));
+        entries.push((
+            "Tile top and bottom".into(),
+            MenuAction::LayoutVertical(group),
+        ));
+        entries.push(("Equalize panes".into(), MenuAction::EqualizeGroup(group)));
+        self.show_context_menu(session_id, entries, x, y);
+    }
+
+    fn show_context_menu(
+        &mut self,
+        session_id: u64,
+        entries: Vec<(String, MenuAction)>,
+        x: u16,
+        y: u16,
+    ) {
         let width = (entries
             .iter()
             .map(|(label, _)| label.len())
@@ -558,10 +558,73 @@ impl App {
             height,
         );
         self.context_menu = Some(ContextMenu {
-            session_id: session.id,
+            session_id,
             area,
             entries,
         });
+    }
+
+    fn place_relative_to_current(&mut self, target: u64, pane: u64, axis: SplitAxis) {
+        let Some(target_index) = self
+            .sessions
+            .iter()
+            .position(|session| session.id == target)
+        else {
+            return;
+        };
+        let group = if let Some(group) = self.sessions[target_index].group {
+            group
+        } else {
+            let group = self.next_group_id;
+            self.next_group_id += 1;
+            self.sessions[target_index].group = Some(group);
+            self.group_layouts.insert(group, PaneLayout::Leaf(target));
+            group
+        };
+        self.place_pane_relative(group, target, pane, axis);
+    }
+
+    fn place_pane_relative(&mut self, group: u64, target: u64, pane: u64, axis: SplitAxis) {
+        if target == pane {
+            return;
+        }
+        let Some(pane_index) = self.sessions.iter().position(|session| session.id == pane) else {
+            return;
+        };
+        let old_group = self.sessions[pane_index].group;
+        if let Some(old_group) = old_group
+            && let Some(layout) = self.group_layouts.remove(&old_group)
+            && let Some(layout) = remove_layout_leaf(layout, pane)
+        {
+            self.group_layouts.insert(old_group, layout);
+        }
+        self.sessions[pane_index].group = None;
+
+        let mut layout = self
+            .group_layouts
+            .remove(&group)
+            .unwrap_or_else(|| layout_for_group(&self.sessions, group));
+        if !insert_layout_leaf(&mut layout, target, pane, axis) {
+            layout = PaneLayout::Split {
+                axis,
+                ratio: 50,
+                first: Box::new(layout),
+                second: Box::new(PaneLayout::Leaf(pane)),
+            };
+        }
+        self.sessions[pane_index].group = Some(group);
+        self.group_layouts.insert(group, layout);
+        if old_group != Some(group) {
+            self.cleanup_groups();
+        }
+        if let Some(target_index) = self
+            .sessions
+            .iter()
+            .position(|session| session.id == target)
+        {
+            self.active = target_index;
+        }
+        self.resize(self.last_area);
     }
 
     fn apply_menu_action(&mut self, session_id: u64, action: MenuAction) {
@@ -594,16 +657,11 @@ impl App {
                 {
                     Some(self.active)
                 } else {
-                    self.sessions
-                        .iter()
-                        .enumerate()
-                        .position(|(candidate, session)| {
-                            candidate != index && session.group.is_none()
-                        })
+                    None
                 };
+                self.next_group_id += 1;
+                self.sessions[index].group = Some(group);
                 if let Some(partner) = partner {
-                    self.next_group_id += 1;
-                    self.sessions[index].group = Some(group);
                     self.sessions[partner].group = Some(group);
                     self.group_layouts.insert(
                         group,
@@ -614,26 +672,10 @@ impl App {
                             second: Box::new(PaneLayout::Leaf(self.sessions[partner].id)),
                         },
                     );
+                } else {
+                    self.group_layouts
+                        .insert(group, PaneLayout::Leaf(self.sessions[index].id));
                 }
-                self.active = index;
-                self.resize(self.last_area);
-            }
-            MenuAction::AddToGroup(group) => {
-                let leaf = PaneLayout::Leaf(self.sessions[index].id);
-                let old = self
-                    .group_layouts
-                    .remove(&group)
-                    .unwrap_or_else(|| layout_for_group(&self.sessions, group));
-                self.sessions[index].group = Some(group);
-                self.group_layouts.insert(
-                    group,
-                    PaneLayout::Split {
-                        axis: SplitAxis::Horizontal,
-                        ratio: 67,
-                        first: Box::new(old),
-                        second: Box::new(leaf),
-                    },
-                );
                 self.active = index;
                 self.resize(self.last_area);
             }
@@ -672,11 +714,8 @@ impl App {
                 );
                 self.resize(self.last_area);
             }
-            MenuAction::SetPaneSplitAxis { group, pane, axis } => {
-                if let Some(layout) = self.group_layouts.get_mut(&group) {
-                    set_leaf_parent_axis(layout, pane, axis);
-                }
-                self.resize(self.last_area);
+            MenuAction::PlaceRelative { target, pane, axis } => {
+                self.place_relative_to_current(target, pane, axis)
             }
             MenuAction::EqualizeGroup(group) => {
                 if let Some(layout) = self.group_layouts.get_mut(&group) {
@@ -921,12 +960,8 @@ impl App {
                 .iter()
                 .find(|(_, area)| contains(*area, mouse.column, mouse.row))
                 .copied()
-            && let Some(index) = self
-                .sessions
-                .iter()
-                .position(|session| session.group == Some(group))
         {
-            self.open_context_menu(index, mouse.column, mouse.row);
+            self.open_group_context_menu(group, mouse.column, mouse.row);
         }
         match mouse.kind {
             MouseEventKind::ScrollUp => self.write_active(b"\x1b[A\x1b[A\x1b[A"),
@@ -1241,23 +1276,23 @@ fn equalize_layout(layout: &mut PaneLayout) {
     }
 }
 
-fn set_leaf_parent_axis(layout: &mut PaneLayout, pane: u64, axis: SplitAxis) -> bool {
-    let PaneLayout::Split {
-        axis: current_axis,
-        first,
-        second,
-        ..
-    } = layout
-    else {
-        return false;
-    };
-    let is_direct_child = matches!(first.as_ref(), PaneLayout::Leaf(id) if *id == pane)
-        || matches!(second.as_ref(), PaneLayout::Leaf(id) if *id == pane);
-    if is_direct_child {
-        *current_axis = axis;
+fn insert_layout_leaf(layout: &mut PaneLayout, target: u64, pane: u64, axis: SplitAxis) -> bool {
+    if matches!(layout, PaneLayout::Leaf(id) if *id == target) {
+        *layout = PaneLayout::Split {
+            axis,
+            ratio: 50,
+            first: Box::new(PaneLayout::Leaf(target)),
+            second: Box::new(PaneLayout::Leaf(pane)),
+        };
         return true;
     }
-    set_leaf_parent_axis(first, pane, axis) || set_leaf_parent_axis(second, pane, axis)
+    match layout {
+        PaneLayout::Split { first, second, .. } => {
+            insert_layout_leaf(first, target, pane, axis)
+                || insert_layout_leaf(second, target, pane, axis)
+        }
+        PaneLayout::Leaf(_) => false,
+    }
 }
 
 fn layout_at_path_mut<'a>(layout: &'a mut PaneLayout, path: &[bool]) -> Option<&'a mut PaneLayout> {
@@ -2040,6 +2075,13 @@ mod tests {
     }
 
     #[test]
+    fn a_group_layout_can_contain_one_pane() {
+        let layout = balanced_layout_ids(&[42], SplitAxis::Horizontal);
+        assert_eq!(layout_leaf_ids(&layout), vec![42]);
+        assert!(matches!(layout, PaneLayout::Leaf(42)));
+    }
+
+    #[test]
     fn removing_a_layout_leaf_collapses_its_empty_split() {
         let layout = balanced_layout_ids(&[1, 2, 3], SplitAxis::Horizontal);
         let layout = remove_layout_leaf(layout, 2).expect("other panes remain");
@@ -2047,9 +2089,11 @@ mod tests {
     }
 
     #[test]
-    fn one_branch_can_change_axis_without_retiling_the_group() {
+    fn pane_can_be_inserted_below_a_specific_target() {
         let mut layout = balanced_layout_ids(&[1, 2, 3, 4], SplitAxis::Horizontal);
-        assert!(set_leaf_parent_axis(&mut layout, 3, SplitAxis::Vertical));
+        let layout_without_four = remove_layout_leaf(layout, 4).expect("other panes remain");
+        layout = layout_without_four;
+        assert!(insert_layout_leaf(&mut layout, 3, 4, SplitAxis::Vertical));
         let PaneLayout::Split {
             axis: root_axis,
             second,
@@ -2066,6 +2110,7 @@ mod tests {
             panic!("expected nested split");
         };
         assert_eq!(*branch_axis, SplitAxis::Vertical);
+        assert_eq!(layout_leaf_ids(&layout), vec![1, 2, 3, 4]);
     }
 
     #[test]
