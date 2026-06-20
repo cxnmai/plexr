@@ -1,0 +1,13 @@
+[package]
+name = "terminal-workspace"
+version = "0.1.0"
+edition = "2024"
+description = "A mouse-first terminal session multiplexer"
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+anyhow = "1"
+crossterm = "0.29"
+portable-pty = "0.9"
+ratatui = "0.30"
+vt100 = "0.16"
