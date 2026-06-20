@@ -1,8 +1,6 @@
 use std::{
     env,
-    fs,
     io::{self, Read, Write},
-    os::unix::io::AsRawFd,
     path::PathBuf,
     sync::{Arc, Mutex, mpsc},
     thread,
@@ -12,7 +10,7 @@ use std::{
 use anyhow::{Context, Result};
 use crossterm::{
     event::{
-        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        self, DisableBracketedPaste, EnableBracketedPaste,
         Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
         MouseEventKind,
     },
@@ -62,7 +60,7 @@ struct Session {
 }
 
 impl Session {
-    fn spawn(id: u64, rows: u16, cols: u16, cwd: PathBuf, host_bg: Option<(u8, u8, u8)>) -> Result<Self> {
+    fn spawn(id: u64, rows: u16, cols: u16, cwd: PathBuf) -> Result<Self> {
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows,
@@ -92,8 +90,6 @@ impl Session {
         let pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let parser_for_reader = Arc::clone(&parser);
         let cwd_for_reader = Arc::clone(&cwd);
-        let writer_for_reader = Arc::clone(&writer);
-        let host_bg_for_reader = host_bg;
         thread::spawn(move || {
             let mut bytes = [0_u8; 16 * 1024];
             while let Ok(read) = reader.read(&mut bytes) {
@@ -102,9 +98,6 @@ impl Session {
                 }
                 if let Ok(mut parser) = parser_for_reader.lock() {
                     parser.process(&bytes[..read]);
-                }
-                if let Ok(mut w) = writer_for_reader.lock() {
-                    respond_to_osc_queries(&bytes[..read], &mut *w, host_bg_for_reader);
                 }
                 update_cwd_from_osc7(&bytes[..read], &cwd_for_reader);
             }
@@ -325,7 +318,6 @@ struct PersistedSession {
 
 struct App {
     host_terminal: String,
-    host_bg: Option<(u8, u8, u8)>,
     sessions: Vec<Session>,
     active: usize,
     sidebar_collapsed: bool,
@@ -350,7 +342,7 @@ impl App {
         group_display_name(&self.group_names, group)
     }
 
-    fn new(area: Rect, host_bg: Option<(u8, u8, u8)>) -> Result<Self> {
+    fn new(area: Rect) -> Result<Self> {
         let terminal = terminal_area(area, false);
         let snapshot = load_workspace_snapshot()
             .ok()
@@ -376,8 +368,7 @@ impl App {
                     terminal.height.max(2),
                     terminal.width.max(2),
                     persisted.cwd,
-                    host_bg,
-                )?;
+            )?;
                 session.custom_name = persisted.custom_name;
                 session.group = persisted.group;
                 if persisted.running_command.is_some() {
@@ -395,7 +386,6 @@ impl App {
                 terminal.height.max(2),
                 terminal.width.max(2),
                 env::current_dir()?,
-                host_bg,
             )?);
         }
         next_session_id = next_session_id.max(
@@ -410,7 +400,6 @@ impl App {
             .unwrap_or(0);
         let mut app = Self {
             host_terminal: detect_host_terminal(),
-            host_bg,
             sessions,
             active,
             sidebar_collapsed: false,
@@ -463,7 +452,6 @@ impl App {
             area.height.max(2),
             area.width.max(2),
             cwd,
-            self.host_bg,
         )?);
         self.next_session_id += 1;
         self.active = self.sessions.len() - 1;
@@ -1384,150 +1372,31 @@ struct TerminalGuard;
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
+        // Disable mouse tracking (1000) and SGR encoding (1006)
+        let _ = io::stdout().write_all(b"\x1b[?1000l\x1b[?1006l");
         let _ = execute!(
             io::stdout(),
-            DisableMouseCapture,
             DisableBracketedPaste,
             LeaveAlternateScreen
         );
     }
 }
 
-fn query_host_terminal_bg() -> Option<(u8, u8, u8)> {
-    let mut tty = fs::File::open("/dev/tty").ok()?;
-    let fd = tty.as_raw_fd();
-
-    // Send OSC 11 query to /dev/tty (the host terminal)
-    let query = b"\x1b]11;?\x1b\x5c";
-    let mut poll_stdout = io::stdout();
-    let _ = poll_stdout.write_all(query);
-    let _ = poll_stdout.flush();
-
-    let mut buf = [0u8; 512];
-    let mut accumulated = Vec::new();
-    let deadline = Instant::now() + Duration::from_millis(200);
-
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-        let mut pfd = libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let ret = unsafe { libc::poll(&mut pfd, 1, remaining.as_millis() as _) };
-        if ret < 0 {
-            // EINTR – retry
-            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            break;
-        }
-        if ret == 0 {
-            break;
-        }
-        match tty.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                accumulated.extend_from_slice(&buf[..n]);
-                // Only stop when we see a complete OSC terminator:
-                // either trailing BEL (0x07) or trailing ST (0x1b 0x5c)
-                if accumulated.ends_with(&[0x07])
-                    || accumulated.ends_with(&[0x1b, 0x5c])
-                {
-                    break;
-                }
-            }
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(_) => break,
-        }
-    }
-    parse_osc_color_response(&accumulated, 11)
-}
-
-fn parse_osc_color_response(data: &[u8], osc_num: u8) -> Option<(u8, u8, u8)> {
-    let s = std::str::from_utf8(data).ok()?;
-    let prefix = format!("\x1b]{};rgb:", osc_num);
-    let start = s.find(&prefix)?;
-    let rest = &s[start + prefix.len()..];
-    let end = rest.find(|c| c == '\x07' || c == '\x1b').unwrap_or(rest.len());
-    let color_str = &rest[..end];
-    let parts: Vec<&str> = color_str.split('/').collect();
-    if parts.len() < 3 {
-        return None;
-    }
-    let r = u16::from_str_radix(parts[0], 16).ok()?;
-    let g = u16::from_str_radix(parts[1], 16).ok()?;
-    let b = u16::from_str_radix(parts[2], 16).ok()?;
-    // Convert from 16-bit (0-65535) or 8-bit (0-255) range to 8-bit
-    let to_u8 = |v: u16| if v > 255 { (v >> 8) as u8 } else { v as u8 };
-    Some((to_u8(r), to_u8(g), to_u8(b)))
-}
-
-fn respond_to_osc_queries(data: &[u8], writer: &mut dyn Write, host_bg: Option<(u8, u8, u8)>) {
-    let bg = host_bg.unwrap_or((30, 30, 30)); // fallback dark gray
-    // Check for OSC 10 or 11 query (\x1b]10;? or \x1b]11;? terminated by \x07 or \x1b\\)
-    let mut i = 0;
-    while i < data.len() {
-        if data[i] == 0x1b && i + 1 < data.len() && data[i + 1] == b']' {
-            // Find the OSC number
-            let start = i + 2;
-            if start < data.len() && (data[start] == b'1' || data[start] == b'0') {
-                let mut osc_end = start;
-                while osc_end < data.len() && data[osc_end] != b';' {
-                    osc_end += 1;
-                }
-                if osc_end < data.len() {
-                    let num_str = std::str::from_utf8(&data[start..osc_end]).ok();
-                    if matches!(num_str, Some("10") | Some("11")) {
-                        // Check for ? query after ;
-                        let q_start = osc_end + 1;
-                        if q_start < data.len() && data[q_start] == b'?' {
-                            // Check for terminator
-                            let mut term_start = q_start + 1;
-                            while term_start < data.len() {
-                                if data[term_start] == 0x07
-                                    || (data[term_start] == 0x1b
-                                        && term_start + 1 < data.len()
-                                        && data[term_start + 1] == b'\\')
-                                {
-                                    // Found complete query - respond
-                                    let (_r, _g, _b) = bg;
-                                    let response = format!(
-                                        "\x1b]{};rgb:{:02x}{:02x}/{:02x}{:02x}/{:02x}{:02x}\x1b\x5c",
-                                        num_str.unwrap(),
-                                        _r, _r, _g, _g, _b, _b
-                                    );
-                                    let _ = writer.write_all(response.as_bytes());
-                                    let _ = writer.flush();
-                                    break;
-                                }
-                                term_start += 1;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        i += 1;
-    }
-}
-
 fn main() -> Result<()> {
-    let host_bg = query_host_terminal_bg();
     enable_raw_mode()?;
     execute!(
         io::stdout(),
         EnterAlternateScreen,
-        EnableMouseCapture,
         EnableBracketedPaste
     )?;
+    // Enable mouse tracking (1000) and SGR encoding (1006), but NOT button-event tracking (1002)
+    // which would prevent text selection via click-and-drag.
+    io::stdout().write_all(b"\x1b[?1000h\x1b[?1006h")?;
+    io::stdout().flush()?;
     let _guard = TerminalGuard;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
-    let mut app = App::new(terminal.size()?.into(), host_bg)?;
+    let mut app = App::new(terminal.size()?.into())?;
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         loop {
